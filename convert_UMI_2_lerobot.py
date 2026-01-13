@@ -2,7 +2,7 @@
 Convert a UMI-style dataset to LeRobot v3.0 format.
 
 Usage:
-    python convert_zarr_to_lerobot.py \
+    python convert_UMI_2_lerobot.py \
         --datasetPath /path/to/dataset/folder \
         --repo_id your_hf_username/pressbutton1 \
         --robot_type ARX_L5 \
@@ -28,7 +28,7 @@ Notes:
   with filenames like "{episode_index}/0.mp4" and "{episode_index}/1.mp4" for wrist and exterior views.
 
 Example:
-    python convert_zarr_to_lerobot.py --datasetPath ./pressButton1 --repo_id "me/pressbutton1" --robot_type "ARX_L5"
+    python convert_UMI_2_lerobot.py --datasetPath /home/phi/Documents/zarr/ARX_dataset_wipe/wipe10 --repo_id "Xihe666/ARX_L5_WipeBoard" --output_root ./output
 """
 
 from pathlib import Path
@@ -41,12 +41,6 @@ import tyro
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, HF_LEROBOT_HOME
 
-# Optional for reading videos
-try:
-    import imageio
-except Exception:
-    imageio = None
-
 
 def convert(
     datasetPath: str,
@@ -58,11 +52,11 @@ def convert(
     push_to_hub: bool = False,
     push_private: bool = False,
 ):
-    zarr_path = Path(datasetPath / replay_buffer.zarr)
+    zarr_path = Path(datasetPath) / "replay_buffer.zarr"
     if not zarr_path.exists():
         raise FileNotFoundError(f"Zarr file or directory not found: {zarr_path}")
 
-    videos_dir = Path(datasetPath / videos)
+    videos_dir = Path(datasetPath) / "videos"
 
     out_root = Path(output_root) if output_root is not None else None
 
@@ -142,12 +136,12 @@ def convert(
             },
         },
         "observation.images.wrist": {
-            "dtype": "float32",
+            "dtype": "video",
             "shape": (720, 1280, 3),
             "names": ["height", "width", "channels"],
         },
         "observation.images.exterior": {
-            "dtype": "float32",
+            "dtype": "video",
             "shape": (720, 1280, 3),
             "names": ["height", "width", "channels"],
         },
@@ -179,11 +173,11 @@ def convert(
     )
 
     # Build episode ranges (start_idx inclusive, end_idx exclusive)
-    starts = [[0] + episode_ends[:-1]].tolist()
-    ends = episode_ends.tolist()
+    starts = [0] + episode_ends[:-1]
+    ends = episode_ends
     episode_idx = 0
 
-    for episode_idx in range(len(starts)):
+    for episode_idx in range(0, n_episodes):
         ep_len = ends[episode_idx] - starts[episode_idx]
         logging.info(
             f"Processing episode {episode_idx}: frames {starts[episode_idx]} to {ends[episode_idx]-1} (len={ep_len})"
@@ -207,7 +201,7 @@ def convert(
             timestamp = data["timestamp"][frame_idx]
 
             frame = {
-                "actions": actions,
+                "action": actions,
                 "observation.state.cartesian_position": eef_pose,
                 "observation.state.joint_position": joint_pos,
                 "observation.state.joint_torque": joint_torque,
@@ -235,11 +229,9 @@ def convert(
 
             # Add frame to dataset
             dataset.add_frame(frame)
-            relative_frame += 1
 
         # save episode (writes parquet metadata and triggers video encoding if needed)
         dataset.save_episode()
-        episode_idx += 1
 
     # Finalize dataset (close writers and flush metadata)
     dataset.finalize()
@@ -248,11 +240,12 @@ def convert(
     if push_to_hub:
         logging.info("Pushing dataset to the Hugging Face Hub...")
         dataset.push_to_hub(
-            tags=[repo_id.split("/")[-1], "converted", "uim"], private=push_private
+            tags=[repo_id.split("/")[-1], "ARX L5"], private=push_private
         )
 
     logging.info("Conversion finished. Dataset root: %s", (dataset.root))
 
-    if __name__ == "__main__":
-        tyro.extras.set_accent_color("green")
-        tyro.cli(convert)
+
+if __name__ == "__main__":
+    tyro.extras.set_accent_color("green")
+    tyro.cli(convert)
