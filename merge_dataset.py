@@ -1,3 +1,5 @@
+import numpy as np
+
 from lerobot.datasets.dataset_tools import (
     add_features,
     delete_episodes,
@@ -6,15 +8,15 @@ from lerobot.datasets.dataset_tools import (
     remove_feature,
     split_dataset,
 )
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 def main():
-    dataset_paths = [
-        "./output",
-        "./output20",
-        "./output30",
+    dataset = [
+        LeRobotDataset("my_local_dataset1", root="./output"),
+        LeRobotDataset("my_local_dataset2", root="./output20"),
+        LeRobotDataset("my_local_dataset3", root="./output30"),
     ]
-    output_path = "./output_merged"
-    merge_datasets(dataset_paths, "Xihe666/ARX_L5_WipeBoard", output_path)
+    merge_datasets(dataset, output_repo_id = "Xihe666/ARX_L5_WipeBoard", output_dir="./output_merged")
 
 if __name__ == "__main__":
     main()
