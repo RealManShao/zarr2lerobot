@@ -26,9 +26,11 @@ Notes:
     - timestamp <- data['timestamp']
 - Video support is built-in: videos are expected in subdirectories named after episode index
   with filenames like "{episode_index}/0.mp4" and "{episode_index}/1.mp4" for wrist and exterior views.
+  When video frame count > episode frame count, linear mapping is used to find corresponding frames.
+  If exact frame mapping fails, nearby frames (n-1, n-2, n-3) are tried as fallback.
 
 Example:
-    python convert_UMI_2_lerobot.py --datasetPath /home/phi/Documents/zarr/ARX_dataset_wipe/wipe10 --repo_id "Xihe666/ARX_L5_WipeBoard" --output_root ./output
+    python convert_UMI_2_lerobot.py --datasetPath /home/phi/Documents/zarr/ARX_dataset_wipe/wipe30 --repo_id "Xihe666/ARX_L5_WipeBoard" --output_root ./output30
 """
 
 from pathlib import Path
@@ -38,8 +40,90 @@ import logging
 import numpy as np
 import zarr
 import tyro
+import cv2
+from pathlib import Path
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, HF_LEROBOT_HOME
+
+
+def get_video_frame_count(video_path: str) -> int:
+    """
+    Get the total number of frames in a video.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        Total number of frames in the video
+    """
+    if not Path(video_path).exists():
+        return 0
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return 0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return total_frames
+
+
+def extract_frame_from_video(video_path: str, frame_idx: int) -> np.ndarray:
+    """
+    Extract a single frame from video at specified frame index.
+
+    Args:
+        video_path: Path to the video file
+        frame_idx: Frame index to extract
+
+    Returns:
+        Numpy array with shape (H, W, 3) and dtype uint8, or None if frame not found
+    """
+    if not Path(video_path).exists():
+        return None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_idx >= total_frames:
+            return None
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if ret:
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return frame_rgb
+        else:
+            return None
+    finally:
+        cap.release()
+
+
+def map_episode_frame_to_video_frame(episode_frame_idx: int, episode_length: int, video_frame_count: int) -> int:
+    """
+    Map episode frame index to corresponding video frame index using linear mapping.
+
+    Args:
+        episode_frame_idx: Index of frame in episode (0 to episode_length-1)
+        episode_length: Total number of frames in episode
+        video_frame_count: Total number of frames in video
+
+    Returns:
+        Corresponding video frame index
+    """
+    if episode_length == 0 or video_frame_count == 0:
+        return 0
+
+    # Linear mapping: episode_frame_idx / episode_length ≈ video_frame_idx / video_frame_count
+    # Solve for video_frame_idx: video_frame_idx = episode_frame_idx * video_frame_count / episode_length
+    video_frame_idx = int(episode_frame_idx * video_frame_count / episode_length)
+
+    # Ensure we don't exceed video bounds
+    return min(video_frame_idx, video_frame_count - 1)
 
 
 def convert(
@@ -48,7 +132,7 @@ def convert(
     *,
     output_root: str | None = None,
     robot_type: str = "ARX_L5",
-    fps: int = 30,
+    fps: int = 10,
     push_to_hub: bool = False,
     push_private: bool = False,
 ):
@@ -71,7 +155,12 @@ def convert(
     # Prepare LeRobot features
     # Basic mapping: actions (7,), state (joint_pos(6,) + gripper_pos(1,) -> 7,)
     UMI_features = {
-        "observation.state.cartesian_position": {
+            "language_instruction": {
+                "dtype": "string",
+                "shape": (1,),
+                "names": None,
+            },
+            "observation.state.cartesian_position": {
             "dtype": "float32",
             "shape": (6,),
             "names": {
@@ -173,7 +262,7 @@ def convert(
     )
 
     # Build episode ranges (start_idx inclusive, end_idx exclusive)
-    starts = [0] + episode_ends[:-1]
+    starts = np.insert(episode_ends[:-1], 0, 0)
     ends = episode_ends
     episode_idx = 0
 
@@ -183,49 +272,101 @@ def convert(
             f"Processing episode {episode_idx}: frames {starts[episode_idx]} to {ends[episode_idx]-1} (len={ep_len})"
         )
 
+        # Get video information for this episode
+        wrist_video_path = videos_dir / f"{episode_idx}/0.mp4"
+        exterior_video_path = videos_dir / f"{episode_idx}/1.mp4"
+
+        wrist_frame_count = get_video_frame_count(str(wrist_video_path))
+        exterior_frame_count = get_video_frame_count(str(exterior_video_path))
+
+        if wrist_video_path.exists() and wrist_frame_count > 0:
+            logging.info(f"Wrist video found: {wrist_frame_count} frames")
+        else:
+            logging.warning(f"Wrist video not found or empty: {wrist_video_path}")
+
+        if exterior_video_path.exists() and exterior_frame_count > 0:
+            logging.info(f"Exterior video found: {exterior_frame_count} frames")
+        else:
+            logging.warning(f"Exterior video not found or empty: {exterior_video_path}")
+
+        # Log frame count comparison
+        if wrist_frame_count > 0:
+            logging.info(f"Episode {episode_idx}: {ep_len} episode frames, {wrist_frame_count} wrist video frames")
+        if exterior_frame_count > 0:
+            logging.info(f"Episode {episode_idx}: {ep_len} episode frames, {exterior_frame_count} exterior video frames")
+
         # Build frames
         for relative_frame in range(0, ep_len):
             frame_idx = starts[episode_idx] + relative_frame
-            # actions
-            actions = np.asarray(data["action"][frame_idx], dtype=np.float32)
-            # joint and gripper positions
-            joint_pos = np.asarray(data["joint_pos"][frame_idx][0:6], dtype=np.float32)
-            joint_torque = np.asarray(
-                data["joint_torque"][frame_idx][0:6], dtype=np.float32
-            )
-            gripper_pos = np.asarray(data["gripper_pos"][frame_idx], dtype=np.float32)
-            gripper_torque = np.asarray(
-                data["gripper_torque"][frame_idx], dtype=np.float32
-            )
-            eef_pose = data["eef_pose"][frame_idx]
-            timestamp = data["timestamp"][frame_idx]
 
+            # Build frame following DROID port structure
             frame = {
-                "action": actions,
-                "observation.state.cartesian_position": eef_pose,
-                "observation.state.joint_position": joint_pos,
-                "observation.state.joint_torque": joint_torque,
-                "observation.state.gripper_position": gripper_pos,
-                "observation.state.gripper_torque": gripper_torque,
+                # Actions
+                "action": np.asarray(data["action"][frame_idx], dtype=np.float32),
+
+                # State observations
+                "observation.state.cartesian_position": np.asarray(data["eef_pose"][frame_idx], dtype=np.float32),
+                "observation.state.joint_position": np.asarray(data["joint_pos"][frame_idx][0:6], dtype=np.float32),
+                "observation.state.joint_torque": np.asarray(data["joint_torque"][frame_idx][0:6], dtype=np.float32),
+                "observation.state.gripper_position": np.asarray(data["gripper_pos"][frame_idx], dtype=np.float32),
+                "observation.state.gripper_torque": np.asarray(data["gripper_torque"][frame_idx], dtype=np.float32),
             }
-            frame["observation.state"] = np.concatenate(
-                [
-                    frame["observation.state.joint_position"],
-                    frame["observation.state.gripper_position"],
-                ]
-            )
 
-            # Add video data to the first frame of each episode only, as video data is typically
-            # associated with the episode rather than individual frames
-            if relative_frame == 0:
-                # For video observations, we add the video data to the first frame
-                # LeRobot likely handles the video processing internally
-                # Look for the episode video file (e.g., episode_0.mp4)
-                wrist_video_path = videos_dir.glob(f"{episode_idx}/0.mp4")
-                exterior_video_path = videos_dir.glob(f"{episode_idx}/1.mp4")
+            # Add combined state (joint + gripper positions) following LeRobot standard
+            frame["observation.state"] = np.concatenate([
+                frame["observation.state.joint_position"],
+                frame["observation.state.gripper_position"]
+            ])
 
-                frame["observation.images.wrist"] = str(wrist_video_path)
-                frame["observation.images.exterior"] = str(exterior_video_path)
+            # Add video frames using linear mapping (only when video frames > episode frames)
+            if wrist_frame_count > ep_len:
+                # Map episode frame to video frame using linear mapping
+                video_frame_idx = map_episode_frame_to_video_frame(relative_frame, ep_len, wrist_frame_count)
+                wrist_frame = extract_frame_from_video(str(wrist_video_path), video_frame_idx)
+
+                # If exact frame not found, try nearby frames (n-1, n-2, n-3)
+                if wrist_frame is None:
+                    for offset in [1, 2, 3]:
+                        if video_frame_idx >= offset:
+                            wrist_frame = extract_frame_from_video(str(wrist_video_path), video_frame_idx - offset)
+                            if wrist_frame is not None:
+                                break
+
+                # If still no frame found, use black placeholder
+                if wrist_frame is None:
+                    wrist_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+                frame["observation.images.wrist"] = wrist_frame
+            else:
+                # Video has fewer or equal frames than episode - use black placeholder
+                frame["observation.images.wrist"] = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+            if exterior_frame_count > ep_len:
+                # Map episode frame to video frame using linear mapping
+                video_frame_idx = map_episode_frame_to_video_frame(relative_frame, ep_len, exterior_frame_count)
+                exterior_frame = extract_frame_from_video(str(exterior_video_path), video_frame_idx)
+
+                # If exact frame not found, try nearby frames (n-1, n-2, n-3)
+                if exterior_frame is None:
+                    for offset in [1, 2, 3]:
+                        if video_frame_idx >= offset:
+                            exterior_frame = extract_frame_from_video(str(exterior_video_path), video_frame_idx - offset)
+                            if exterior_frame is not None:
+                                break
+
+                # If still no frame found, use black placeholder
+                if exterior_frame is None:
+                    exterior_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+                frame["observation.images.exterior"] = exterior_frame
+            else:
+                # Video has fewer or equal frames than episode - use black placeholder
+                frame["observation.images.exterior"] = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+            # language_instruction is also stored as "task" to follow LeRobot standard
+            frame["language_instruction"] = "wipe_board"
+            frame["task"] = frame["language_instruction"]
+
 
             # Add frame to dataset
             dataset.add_frame(frame)
